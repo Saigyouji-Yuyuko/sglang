@@ -43,7 +43,10 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    largest_take,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -623,30 +626,119 @@ class TestPrefillAdder(CustomTestCase):
         )  # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
 
-    def test_preempt_prices_a_unified_request_in_owner_tokens(self):
-        """A unified chain's scalar preemption budget counts owner tokens, not
-        `available_size` (here a quarter of it)."""
+    def test_preempt_prices_a_unified_request_as_one_demand(self):
+        """A unified chain releases the fewest lower-priority requests after
+        which the request's whole demand (tokens beside every window) is admitted."""
         running = self.create_mock_req("run", priority=0, max_new_tokens=100)
         self.scheduling_order(schedule_low_priority_values_first=False)
         allocator = self.mock_token_allocator
-        allocator.full_available_size.return_value = 1600
-        allocator.available_size.return_value = 400
         allocator.mamba_allocator = None
         allocator.window_pool_names.return_value = ("swa",)
+        allocator.sub_pool_roles.return_value = ("full", ("swa",), None)
         self.mock_tree_cache.window_retain_size.side_effect = lambda name: 32
         self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+        self.mock_tree_cache.window_evictable_size.return_value = 0
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             ChainPrefillBudget(allocator, tree_cache, **kwargs)
         )
+        asked = []
+
+        def admits(demand, **kwargs):
+            asked.append(demand)
+            return demand.full_tokens <= 900
+
+        allocator.admits.side_effect = admits
+        # The running request's window rows are not what lets it in here.
+        allocator.storage.units_freed_by_release.return_value = {}
         running_batch = self.create_running_batch([running])
         adder = self.create_adder(running_batch, page_size=4)
         self.assertEqual(adder.memory_budget.total_offset, 100)
-        self.assertEqual(adder.rem_total_tokens, 1500)
 
         new_req = self.create_mock_req("new", priority=1, max_new_tokens=32)
         new_req.full_untruncated_fill_ids = [0] * 800
         self.assertTrue(adder.preempt_to_schedule(new_req))
         self.assertIn(running, adder.preempt_list)
+        # Priced once the running request's decode is given back, with the
+        # request's window demand beside its tokens.
+        self.assertTrue(asked)
+        self.assertLessEqual(asked[-1].full_tokens, 900)
+        self.assertIn("swa", asked[-1].window_tokens)
+
+        # A window that cannot take the request refuses the preemption,
+        # whatever the tokens given back.
+        allocator.admits.side_effect = lambda demand, **kwargs: False
+        other = self.create_mock_req("other", priority=0, max_new_tokens=100)
+        adder = self.create_adder(self.create_running_batch([other]), page_size=4)
+        self.assertFalse(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [])
+
+    def test_preempt_credits_the_rows_a_unified_victim_holds(self):
+        """Regression: on a shared pool too full for the request, preempting a
+        request frees the owner rows it holds as well as its window rows; crediting
+        only its window rows and pending decode refused the preemption."""
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        shared = self.create_shared_adder(total_bytes=8192)
+        allocator = shared.token_to_kv_pool_allocator
+        held = allocator.alloc(64)
+        self.assertIsNotNone(held)
+        while allocator.alloc(4) is not None:
+            pass
+        victim = self.create_mock_req("run", priority=0, max_new_tokens=1)
+        victim.kv = ReqKvInfo(req_pool_idx=0, kv_committed_len=64, kv_allocated_len=64)
+        victim.owned_kv_len.return_value = 64
+        adder = self.create_adder(
+            self.create_running_batch([victim]),
+            page_size=4,
+            rem_chunk_tokens=16,
+            token_to_kv_pool_allocator=allocator,
+        )
+        new_req = self.create_shared_req("new")
+        new_req.priority = 1
+        budget = adder.memory_budget
+        demand = budget.request_demand(12, 4, chunk_limit=16)
+        self.assertFalse(budget._admits(demand))
+
+        self.assertTrue(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [victim])
+        # The release it counted on admits the request.
+        allocator.free(held)
+        self.assertTrue(budget._admits(demand))
+
+    def test_retained_dllm_block_resumes_without_room_for_a_fresh_one(self):
+        """Regression: a dLLM request whose unfinished block keeps its rows needs no
+        new rows to run it again; pricing it as a fresh block left it waiting
+        forever once the pool could not hold another block."""
+        block = 16
+        adder = self.create_shared_adder()
+        allocator = adder.token_to_kv_pool_allocator
+        self.assertIsNotNone(allocator.alloc(block))
+        while adder.memory_budget.largest_chunk_tokens(block) >= block:
+            self.assertIsNotNone(allocator.alloc(4))
+        dllm = SimpleNamespace(
+            block_size=block,
+            max_running_requests=2,
+            requires_separate_context_encoding=False,
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=4,
+            rem_chunk_tokens=block,
+            token_to_kv_pool_allocator=allocator,
+            dllm_config=dllm,
+        )
+        req = self.create_shared_req("dllm")
+        req.full_untruncated_fill_ids = list(range(block))
+        req.dllm_incomplete_ids = list(range(block))
+        req.kv = ReqKvInfo(req_pool_idx=0, kv_committed_len=0, kv_allocated_len=block)
+        req.is_dllm_prefill.return_value = False
+        req.extend_end = None
+
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_end, block)
+        # Its rows are not charged again beside this pass's writes.
+        self.assertLess(adder.memory_budget.current_offset, block)
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -1825,7 +1917,7 @@ class TestPrefillAdder(CustomTestCase):
         admitted beside it would take the room it waits for."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
         adder, _ = self._pressured_shared_adder(
-            running=1, held_tokens=allocator.available_size() - 4
+            running=1, held_tokens=largest_take(allocator) - 4
         )
         continuation = self.create_shared_req("continuation", max_new_tokens=4096)
         continuation.prefix_len = 4
@@ -1861,7 +1953,7 @@ class TestPrefillAdder(CustomTestCase):
         # Rows held by no running request (a transfer, a load): with nothing
         # running, the continuation shrinks to the rows there are.
         adder, _ = self._pressured_shared_adder(
-            running=0, held_tokens=allocator.available_size() - 12
+            running=0, held_tokens=largest_take(allocator) - 12
         )
         continuation = self.create_shared_req("continuation", max_new_tokens=4096)
         continuation.prefix_len = 0
@@ -1895,7 +1987,7 @@ class TestPrefillAdder(CustomTestCase):
         """A request that fits an empty pool but not now waits while running work
         will give memory back; with nothing to give back it is unschedulable."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
-        capacity = allocator.available_size()
+        capacity = largest_take(allocator)
         for running, held, expected in (
             (1, capacity - 8, AddReqResult.NO_TOKEN),
             (0, capacity - 8, AddReqResult.UNSCHEDULABLE),
@@ -1918,7 +2010,7 @@ class TestPrefillAdder(CustomTestCase):
         so it can make progress at all."""
         adder, allocator = self._pressured_shared_adder(running=1, held_tokens=0)
         req = self.create_shared_req("long", max_new_tokens=4096)
-        req.full_untruncated_fill_ids = list(range(allocator.available_size() * 2))
+        req.full_untruncated_fill_ids = list(range(largest_take(allocator) * 2))
         adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
         self.assertEqual(adder.can_run_list, [req])
         self.assertIs(adder.new_chunked_req, req)
@@ -1928,7 +2020,7 @@ class TestPrefillAdder(CustomTestCase):
         """A continuation waits, closing the pass, while other row holders will
         free memory; with no other holder it shrinks to make progress."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
-        capacity = allocator.available_size()
+        capacity = largest_take(allocator)
         held = capacity - 8
         adder, _ = self._pressured_shared_adder(running=1, held_tokens=held)
         continuation = self.create_shared_req("continuation")
@@ -1950,7 +2042,7 @@ class TestPrefillAdder(CustomTestCase):
         """An idle streaming session's parked row gives no memory back, so a
         continuation shrinks to fit rather than wait for the session to close."""
         probe, _ = self._pressured_shared_adder(running=0, held_tokens=0)
-        held = probe.token_to_kv_pool_allocator.available_size() - 8
+        held = largest_take(probe.token_to_kv_pool_allocator) - 8
         adder, allocator = self._pressured_shared_adder(running=0, held_tokens=held)
         storage = kv_storage_of(None, allocator)
         session = StreamingSession(
@@ -2031,7 +2123,7 @@ class TestPrefillAdder(CustomTestCase):
             return req
 
         capacity = adder_after(0, park=False).token_to_kv_pool_allocator
-        capacity = capacity.available_size()
+        capacity = largest_take(capacity)
         found = False
         for held in range(0, capacity, 4):
             waiting = adder_after(held, park=False)
@@ -2091,7 +2183,7 @@ class TestPrefillAdder(CustomTestCase):
                 max_new = allocator.max_new_tokens_for_memory(
                     prompt,
                     4096,
-                    token_capacity=allocator.available_size(),
+                    token_capacity=largest_take(allocator),
                     sliding_window_size=8,
                     chunk_size=16,
                     **RETIRE_AT_ONCE,
